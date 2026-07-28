@@ -35,14 +35,28 @@ def _write_lib(tmp_path: Path, name: str, symbols: list) -> Path:
 
 
 def _write_table(table_path: Path, libs: list) -> None:
-    """Write a sym-lib-table file. libs = list of (name, uri, quote_uri)."""
+    """Write a sym-lib-table file.
+
+    libs = list of (name, uri, quote_uri) or (name, uri, quote_uri, type).
+    type defaults to "KiCad"; pass "Table" for an included-table entry.
+    """
     lines = ["(sym_lib_table"]
-    for name, uri, quote in libs:
+    for entry in libs:
+        name, uri, quote = entry[0], entry[1], entry[2]
+        lib_type = entry[3] if len(entry) > 3 else "KiCad"
         uri_str = f'"{uri}"' if quote else uri
-        lines.append(f'  (lib (name "{name}")(type "KiCad")(uri {uri_str})(options "")(descr ""))')
+        lines.append(
+            f'  (lib (name "{name}")(type "{lib_type}")(uri {uri_str})(options "")(descr ""))'
+        )
     lines.append(")")
     table_path.parent.mkdir(parents=True, exist_ok=True)
     table_path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def _global_table_path(fake_home: Path, version: str = "9.0") -> Path:
+    if os.name == "nt":
+        return fake_home / "AppData" / "Roaming" / "kicad" / version / "sym-lib-table"
+    return fake_home / ".config" / "kicad" / version / "sym-lib-table"
 
 
 def test_global_sym_lib_table_resolves_library(monkeypatch, tmp_path):
@@ -137,3 +151,96 @@ def test_unknown_library_returns_none(monkeypatch, tmp_path):
     monkeypatch.setattr(Path, "home", lambda: fake_home)
     loader = DynamicSymbolLoader(project_path=None)
     assert loader.find_library_file("NoSuchLib") is None
+
+
+def test_included_table_entry_is_followed(monkeypatch, tmp_path):
+    """A (type "Table") entry names another sym-lib-table and must be followed.
+
+    This is KiCad 10's global layout: the user table lists no libraries at all,
+    only a Table entry pointing at the bundled template table. Not following it
+    made the newest version's table look empty, so lookups fell through to an
+    older KiCad's table and cached that version's symbols.
+    """
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    lib_dir = tmp_path / "kicad10" / "symbols"
+    lib_dir.mkdir(parents=True)
+    lib_file = _write_lib(lib_dir, "Device", ["R_Small"])
+
+    # The bundled template table holds the real entries
+    template = tmp_path / "kicad10" / "template" / "sym-lib-table"
+    _write_table(template, [("Device", str(lib_file), True)])
+
+    # The user-global table only points at it
+    _write_table(
+        _global_table_path(fake_home, "10.0"),
+        [("KiCad", str(template), True, "Table")],
+    )
+
+    monkeypatch.setattr(Path, "home", lambda: fake_home)
+    loader = DynamicSymbolLoader(project_path=None)
+
+    resolved = loader.find_library_file("Device")
+    assert resolved is not None, "Table indirection was not followed"
+    assert Path(resolved).resolve() == lib_file.resolve()
+
+
+def test_direct_entry_wins_over_included_table(monkeypatch, tmp_path):
+    """A direct entry in a table beats one reached through its Table include."""
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+
+    direct_dir = tmp_path / "direct"
+    direct_dir.mkdir()
+    direct_lib = _write_lib(direct_dir, "DualLib", ["FROM_DIRECT"])
+
+    included_dir = tmp_path / "included"
+    included_dir.mkdir()
+    included_lib = _write_lib(included_dir, "DualLib", ["FROM_INCLUDED"])
+
+    template = tmp_path / "template" / "sym-lib-table"
+    _write_table(template, [("DualLib", str(included_lib), True)])
+
+    # Include listed FIRST, direct entry second -- order must not decide it
+    _write_table(
+        _global_table_path(fake_home, "10.0"),
+        [
+            ("KiCad", str(template), True, "Table"),
+            ("DualLib", str(direct_lib), True),
+        ],
+    )
+
+    monkeypatch.setattr(Path, "home", lambda: fake_home)
+    loader = DynamicSymbolLoader(project_path=None)
+
+    assert Path(loader.find_library_file("DualLib")).resolve() == direct_lib.resolve()
+
+
+def test_self_referencing_table_does_not_recurse_forever(monkeypatch, tmp_path):
+    """A table that includes itself must terminate and return None."""
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    table = _global_table_path(fake_home, "10.0")
+    table.parent.mkdir(parents=True, exist_ok=True)
+    _write_table(table, [("Loop", str(table), True, "Table")])
+
+    monkeypatch.setattr(Path, "home", lambda: fake_home)
+    loader = DynamicSymbolLoader(project_path=None)
+
+    assert loader.find_library_file("Whatever") is None
+
+
+def test_mutually_recursive_tables_terminate(monkeypatch, tmp_path):
+    """Two tables including each other must terminate rather than hang."""
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    a = tmp_path / "a" / "sym-lib-table"
+    b = tmp_path / "b" / "sym-lib-table"
+    _write_table(a, [("B", str(b), True, "Table")])
+    _write_table(b, [("A", str(a), True, "Table")])
+    _write_table(_global_table_path(fake_home, "10.0"), [("A", str(a), True, "Table")])
+
+    monkeypatch.setattr(Path, "home", lambda: fake_home)
+    loader = DynamicSymbolLoader(project_path=None)
+
+    assert loader.find_library_file("Missing") is None

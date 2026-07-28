@@ -218,32 +218,77 @@ class DynamicSymbolLoader:
                 candidates.append(base / v / "sym-lib-table")
         return candidates
 
-    def _resolve_library_from_table(self, table_path: Path, library_name: str) -> Optional[Path]:
-        """Parse a sym-lib-table file and return the resolved path for the given library nickname."""
+    def _resolve_library_from_table(
+        self, table_path: Path, library_name: str, _seen: Optional[set] = None
+    ) -> Optional[Path]:
+        """Parse a sym-lib-table file and return the resolved path for the given library nickname.
+
+        Follows `(type "Table")` entries, which name another sym-lib-table rather
+        than a library. KiCad 10's user-global table lists no libraries directly:
+        it carries a single Table entry pointing at the bundled template table,
+        where the ~222 real entries live. Without following that indirection a
+        lookup for e.g. `Device` misses here, falls through to an older KiCad's
+        global table, and silently caches that version's symbols into a
+        current-version project -- which surfaces much later as a wall of
+        `lib_symbol_mismatch` ERC warnings that refreshing cannot clear, because
+        the refresh reads the same wrong table.
+        """
+        if _seen is None:
+            _seen = set()
+        try:
+            key = table_path.resolve()
+        except OSError:
+            key = table_path
+        if key in _seen:  # a table that includes itself, directly or in a cycle
+            return None
+        _seen.add(key)
+
+        nested_tables = []
         try:
             with open(table_path, "r", encoding="utf-8") as f:
                 content = f.read()
 
-            # Name and URI may be quoted (with embedded spaces, e.g. OneDrive paths)
-            # or bare. Match a quoted "..." form first, otherwise a bareword that
-            # excludes whitespace and parens.
+            # Name, type and URI may be quoted (with embedded spaces, e.g.
+            # OneDrive paths) or bare. Match a quoted "..." form first, otherwise
+            # a bareword that excludes whitespace and parens.
             lib_pattern = (
                 r"\(lib\s+"
                 r'\(name\s+(?:"([^"]+)"|([^"\)\s]+))\)\s*'
-                r"\(type\s+[^)]+\)\s*"
+                r'\(type\s+(?:"([^"]+)"|([^"\)\s]+))\)\s*'
                 r'\(uri\s+(?:"([^"]+)"|([^"\)\s]+))'
             )
             for match in re.finditer(lib_pattern, content, re.IGNORECASE):
-                # Groups: 1=quoted name, 2=bare name, 3=quoted uri, 4=bare uri
+                # Groups: 1/2=name, 3/4=type, 5/6=uri (quoted or bare)
                 nickname = match.group(1) or match.group(2)
+                lib_type = (match.group(3) or match.group(4) or "").strip().lower()
+                uri = match.group(5) or match.group(6)
+
+                if lib_type == "table":
+                    # Defer: a direct hit in this table still wins over an
+                    # included one, matching KiCad's own precedence.
+                    nested_tables.append(uri)
+                    continue
+
                 if nickname != library_name:
                     continue
-                uri = match.group(3) or match.group(4)
                 resolved = self._resolve_sym_uri(uri)
                 if resolved and Path(resolved).exists():
                     return Path(resolved)
         except Exception as e:
             logger.warning(f"Could not parse sym-lib-table {table_path}: {e}")
+            return None
+
+        for uri in nested_tables:
+            resolved = self._resolve_sym_uri(uri)
+            if not resolved:
+                continue
+            nested_path = Path(resolved)
+            if not nested_path.exists():
+                continue
+            hit = self._resolve_library_from_table(nested_path, library_name, _seen)
+            if hit:
+                logger.info(f"Found '{library_name}' via included table {nested_path}: {hit}")
+                return hit
         return None
 
     def _resolve_sym_uri(self, uri: str) -> Optional[str]:
